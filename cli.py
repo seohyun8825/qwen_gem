@@ -140,10 +140,12 @@ def run_one_video(
     if no_decompose:
         heatmaps = {"no_decomposed": heatmap_action}
         labels = {"no_decomposed": question}
+        weights = None
     else:
         heatmaps = {"verb": heatmap_verb, "object": heatmap_object, "action": heatmap_action}
         labels = {"verb": prompt_verb, "object": prompt_object, "action": prompt_action}
-    save_heatmaps_and_peaks(out_dir, frames_bgr, heatmaps, labels=labels)
+        weights = None
+    save_heatmaps_and_peaks(out_dir, frames_bgr, heatmaps, weights=weights, labels=labels)
     save_meta(
         out_dir,
         {

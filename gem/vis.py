@@ -25,10 +25,31 @@ def save_heatmaps_and_peaks(
     if weights:
         peak_log["final"] = []
 
+    save_raw = os.environ.get("GEM_SAVE_RAW_HEATMAP", "").lower() in {"1", "true", "yes"}
+    raw_dir = None
+    if save_raw:
+        raw_dir = os.path.join(out_dir, "raw_arrays")
+        os.makedirs(raw_dir, exist_ok=True)
+
     for frame_index in range(num_frames):
         frame_peaks = {}
         for key, heatmap_stack in heatmaps.items():
-            overlay = upsample_and_overlay(frames_bgr[frame_index], heatmap_stack[frame_index])
+            safe_key = str(key).replace(" ", "_")
+            if save_raw and frame_index == 0:
+                np.save(os.path.join(raw_dir, f"{safe_key}.npy"), heatmap_stack)
+
+            stack_min = None
+            stack_max = None
+            if os.environ.get("GEM_STACK_NORMALIZE", "").lower() in {"1", "true", "yes"}:
+                stack_min = float(heatmap_stack.min())
+                stack_max = float(heatmap_stack.max())
+
+            overlay = upsample_and_overlay(
+                frames_bgr[frame_index],
+                heatmap_stack[frame_index],
+                min_val=stack_min,
+                max_val=stack_max,
+            )
             resized_heatmap = cv2.resize(
                 heatmap_stack[frame_index],
                 (frames_bgr[frame_index].shape[1], frames_bgr[frame_index].shape[0]),
@@ -48,7 +69,6 @@ def save_heatmaps_and_peaks(
                     1,
                     cv2.LINE_AA,
                 )
-            safe_key = str(key).replace(" ", "_")
             cv2.imwrite(os.path.join(out_dir, f"{safe_key}_f{frame_index:03d}.png"), overlay)
             peak_log[key].append({"frame": frame_index, "x": x_coord, "y": y_coord})
             frame_peaks[key] = (x_coord, y_coord)
