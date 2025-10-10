@@ -1,3 +1,5 @@
+import os
+
 import spacy
 
 _NLP = None
@@ -11,6 +13,9 @@ def _nlp():
 
 
 def split_action_prompt(text: str):
+    if os.environ.get("GEM_NO_DECOMPOSE") == "1":
+        return text, text, text
+
     doc = _nlp()(text)
     verbs = [token.lemma_ for token in doc if token.pos_ == "VERB"]
     nouns = [token.lemma_ for token in doc if token.pos_ in ("NOUN", "PROPN")]

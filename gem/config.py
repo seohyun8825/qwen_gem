@@ -19,4 +19,4 @@ SAMPLE_STRIDE = 1
 SEED = 1234
 
 CMAP = "jet"
-ALPHA = 0.45
+ALPHA = 0.8

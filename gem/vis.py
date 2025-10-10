@@ -12,17 +12,20 @@ from .heatmap import peak_coordinate, upsample_and_overlay
 def save_heatmaps_and_peaks(
     out_dir: str,
     frames_bgr: np.ndarray,
-    hm_verb: np.ndarray,
-    hm_object: np.ndarray,
-    hm_action: np.ndarray,
+    heatmaps: Dict[str, np.ndarray],
+    weights: Dict[str, float] | None = None,
+    labels: Dict[str, str] | None = None,
 ) -> None:
-    weights = {"verb": W_VERB, "object": W_OBJECT, "action": W_ACTION}
     os.makedirs(out_dir, exist_ok=True)
     num_frames = frames_bgr.shape[0]
-    peak_log = {"verb": [], "object": [], "action": [], "final": []}
+    if weights is None and set(heatmaps.keys()) == {"verb", "object", "action"}:
+        weights = {"verb": W_VERB, "object": W_OBJECT, "action": W_ACTION}
+
+    peak_log: Dict[str, List[Dict[str, float]]] = {key: [] for key in heatmaps.keys()}
+    if weights:
+        peak_log["final"] = []
 
     for frame_index in range(num_frames):
-        heatmaps = {"verb": hm_verb, "object": hm_object, "action": hm_action}
         frame_peaks = {}
         for key, heatmap_stack in heatmaps.items():
             overlay = upsample_and_overlay(frames_bgr[frame_index], heatmap_stack[frame_index])
@@ -33,13 +36,28 @@ def save_heatmaps_and_peaks(
             )
             x_coord, y_coord = peak_coordinate(resized_heatmap)
             cv2.circle(overlay, (x_coord, y_coord), 6, (255, 255, 255), 2)
-            cv2.imwrite(os.path.join(out_dir, f"heatmap_{key}_f{frame_index:03d}.png"), overlay)
+            label_text = labels.get(key) if labels else key
+            if label_text:
+                cv2.putText(
+                    overlay,
+                    label_text,
+                    (10, overlay.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            safe_key = str(key).replace(" ", "_")
+            cv2.imwrite(os.path.join(out_dir, f"{safe_key}_f{frame_index:03d}.png"), overlay)
             peak_log[key].append({"frame": frame_index, "x": x_coord, "y": y_coord})
             frame_peaks[key] = (x_coord, y_coord)
 
-        final_x = sum(frame_peaks[key][0] * weights[key] for key in ["verb", "object", "action"])
-        final_y = sum(frame_peaks[key][1] * weights[key] for key in ["verb", "object", "action"])
-        peak_log["final"].append({"frame": frame_index, "x": final_x, "y": final_y})
+        if weights:
+            valid_keys = [k for k in weights.keys() if k in frame_peaks]
+            final_x = sum(frame_peaks[k][0] * weights[k] for k in valid_keys)
+            final_y = sum(frame_peaks[k][1] * weights[k] for k in valid_keys)
+            peak_log["final"].append({"frame": frame_index, "x": final_x, "y": final_y})
 
     with open(os.path.join(out_dir, "final_peaks.json"), "w") as fp:
         json.dump(peak_log, fp, indent=2)

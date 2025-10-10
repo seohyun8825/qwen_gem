@@ -115,9 +115,14 @@ def run_one_video(
     grid = vit_outputs["grid"]
     has_cls = vit_outputs["has_cls"]
 
-    gem_outputs = gem_whitebox(layers, qkv, has_cls, text_eos=emb_action)
-    fused_tokens = gem_outputs["O_comb"]
-    layer_weights = gem_outputs["w_comb"]
+    disable_whitebox = os.environ.get("GEM_DISABLE_WHITEBOX", "").lower() in {"1", "true", "yes"}
+    if disable_whitebox:
+        fused_tokens = layers[-1]
+        layer_weights = None
+    else:
+        gem_outputs = gem_whitebox(layers, qkv, has_cls, text_eos=emb_action)
+        fused_tokens = gem_outputs["O_comb"]
+        layer_weights = gem_outputs["w_comb"]
 
     fused_tokens = _apply_mm_projector(model, fused_tokens).detach()
     target_device = fused_tokens.device
@@ -131,7 +136,14 @@ def run_one_video(
     heatmap_action = token_sim_heatmap(fused_tokens, emb_action, has_cls, grid).to(torch.float32).cpu().numpy()
 
     os.makedirs(out_dir, exist_ok=True)
-    save_heatmaps_and_peaks(out_dir, frames_bgr, heatmap_verb, heatmap_object, heatmap_action)
+    no_decompose = os.environ.get("GEM_NO_DECOMPOSE") == "1"
+    if no_decompose:
+        heatmaps = {"no_decomposed": heatmap_action}
+        labels = {"no_decomposed": question}
+    else:
+        heatmaps = {"verb": heatmap_verb, "object": heatmap_object, "action": heatmap_action}
+        labels = {"verb": prompt_verb, "object": prompt_object, "action": prompt_action}
+    save_heatmaps_and_peaks(out_dir, frames_bgr, heatmaps, labels=labels)
     save_meta(
         out_dir,
         {
@@ -145,6 +157,7 @@ def run_one_video(
             "grid": grid,
             "has_cls": has_cls,
             "w_comb": layer_weights,
+            "whitebox_enabled": not disable_whitebox,
             "device": DEVICE,
         },
     )
