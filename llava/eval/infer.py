@@ -1,19 +1,45 @@
 import argparse
 import copy
+import json
+import math
+import multiprocessing as mp
+import os
+import functools
+import itertools
+import random
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import warnings
 from decord import VideoReader, cpu
 import numpy as np
-import json
-import multiprocessing as mp
-import os
-from multiprocessing import Pool
-import functools
-import itertools
-import random
 from tqdm import tqdm
+from PIL import Image
+from rapidfuzz import process as fuzzy_process, fuzz as fuzzy_fuzz
+from sentence_transformers import SentenceTransformer, util as st_util
+import spacy
+import open_clip
 
-from ERF.patch_infer import maybe_build_engine, run_erf_sample
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# ---- Shot segmentation (PySceneDetect) ----
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
+import cv2
+
+try:
+    from ERF.patch_infer import maybe_build_engine, run_erf_sample
+except ImportError:  # pragma: no cover
+    maybe_build_engine = None
+    run_erf_sample = None
 
 try:  # pragma: no cover
     from icecream import ic
@@ -56,8 +82,796 @@ if hasattr(torch.backends, "cuda") and torch.cuda.is_available():
 
 warnings.filterwarnings("ignore")
 
+
+def detect_shots(video_path: str, threshold: float = 27.0, min_scene_len: int = 15):
+    """Return list of (start_frame, end_frame) shots."""
+    vm = VideoManager([video_path])
+    sm = SceneManager()
+    sm.add_detector(ContentDetector(threshold=threshold, min_scene_len=min_scene_len))
+    vm.start()
+    sm.detect_scenes(frame_source=vm)
+    scene_list = sm.get_scene_list()
+    vm.release()
+    out = []
+    for start, end in scene_list:
+        first, last = start.get_frames(), end.get_frames()
+        if last > first:
+            out.append((first, last))
+    return out
+
+
+def read_frame(video_path: str, frame_idx: int):
+    """Return RGB frame (H, W, 3)."""
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ok, frm = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"Failed to read frame {frame_idx} from {video_path}")
+    return frm[:, :, ::-1]
+
+
+_SPACY_NLP = None
+_TEXT_ENCODER = None
+_TEXT_ENCODER_NAME = "all-MiniLM-L6-v2"
+_CLIP_CACHE: Dict[str, Any] = {}
+
+
+def get_nlp():
+    global _SPACY_NLP
+    if _SPACY_NLP is None:
+        _SPACY_NLP = spacy.load("en_core_web_sm")
+    return _SPACY_NLP
+
+
+def get_text_encoder():
+    global _TEXT_ENCODER
+    if _TEXT_ENCODER is None:
+        _TEXT_ENCODER = SentenceTransformer(_TEXT_ENCODER_NAME)
+    return _TEXT_ENCODER
+
+
+def get_clip_bundle(device: torch.device):
+    key = str(device)
+    if key in _CLIP_CACHE:
+        return _CLIP_CACHE[key]
+    created = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+    if isinstance(created, tuple):
+        if len(created) == 3:
+            model, _preprocess_train, preprocess = created
+        elif len(created) == 2:
+            model, preprocess = created
+        else:
+            raise ValueError("Unexpected return signature from open_clip.create_model_and_transforms")
+    else:
+        raise ValueError("open_clip.create_model_and_transforms returned unexpected object")
+    tokenizer = open_clip.get_tokenizer("ViT-B-32")
+    model = model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    bundle = {"model": model, "preprocess": preprocess, "tokenizer": tokenizer}
+    _CLIP_CACHE[key] = bundle
+    return bundle
+
+
 def fuzzy_matching(pred):
     return pred.split(' ')[0].rstrip('.').strip()
+
+
+def build_query_text(sample: Dict[str, Any]) -> Tuple[str, List[str]]:
+    question = (sample.get("question") or "").strip()
+    choices = sample.get("candidates") or []
+    if isinstance(choices, dict):
+        choices = list(choices.values())
+    formatted_choices = []
+    for idx, choice in enumerate(choices):
+        if isinstance(choice, dict):
+            choice_text = choice.get("text") or choice.get("answer") or ""
+        else:
+            choice_text = str(choice)
+        choice_text = choice_text.strip()
+        if not choice_text:
+            continue
+        formatted_choices.append(choice_text)
+    if formatted_choices:
+        joined_choices = "\nChoices:\n" + "\n".join(formatted_choices)
+    else:
+        joined_choices = ""
+    query_text = question + ("\n" + joined_choices if joined_choices else "")
+    return query_text.strip(), formatted_choices
+
+
+def compute_frame_relevance(
+    img_rgb: np.ndarray,
+    query_text: str,
+    clip_bundle: Dict[str, Any],
+    device: torch.device,
+) -> float:
+    pil_img = Image.fromarray(img_rgb)
+    image_tensor = clip_bundle["preprocess"](pil_img).unsqueeze(0).to(device)
+    text_tokens = clip_bundle["tokenizer"]([query_text]).to(device)
+    with torch.no_grad():
+        image_feat = clip_bundle["model"].encode_image(image_tensor)
+        text_feat = clip_bundle["model"].encode_text(text_tokens)
+    image_feat = image_feat / image_feat.norm(dim=-1, keepdim=True)
+    text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+    sim = (image_feat * text_feat).sum(dim=-1)
+    return float(sim.cpu().item())
+
+
+def extract_query_slots(query: str) -> List[str]:
+    nlp = get_nlp()
+    doc = nlp(query)
+    slots: List[str] = []
+    for token in doc:
+        if token.pos_ in {"NOUN", "PROPN", "ADJ", "NUM"}:
+            slots.append(token.lemma_.lower())
+    return slots
+
+
+def normalize_choice_label(choice_text: str) -> Tuple[str, str]:
+    cleaned = choice_text.strip()
+    match = re.match(r"^\s*([A-Z])[\.\)]\s*(.*)$", cleaned)
+    if match:
+        return match.group(1), match.group(2) or cleaned
+    return cleaned, cleaned
+
+
+def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Attempt to extract JSON substring.
+        first = text.find("{")
+        last = text.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            snippet = text[first:last + 1]
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+class QAIGraphState:
+    ALPHA = 0.5
+    BETA = 0.2
+    GAMMA = 0.3
+
+    def __init__(
+        self,
+        text_encoder: SentenceTransformer,
+        query_text: str,
+        query_embedding: np.ndarray,
+        query_slots: List[str],
+        choices: List[str],
+        decay_tau: float = 45.0,
+    ):
+        self.text_encoder = text_encoder
+        self.query_text = query_text
+        self.query_embedding = query_embedding
+        self.query_slots = query_slots
+        self.decay_tau = decay_tau
+        self.nodes: Dict[str, Dict[str, Any]] = {}
+        self.edges: List[Dict[str, Any]] = []
+        self.edge_lookup: Dict[Tuple[str, str, str], int] = {}
+        self.choices = {
+            choice: {"score": 0.0, "evidence": []} for choice in choices
+        }
+        self.choice_embeddings = {
+            choice: self.text_encoder.encode(choice, normalize_embeddings=True)
+            for choice in choices
+        }
+        self.emb_cache: Dict[str, np.ndarray] = {}
+
+    def encode_text(self, text: str) -> np.ndarray:
+        cached = self.emb_cache.get(text)
+        if cached is not None:
+            return cached
+        emb = self.text_encoder.encode(text, normalize_embeddings=True)
+        self.emb_cache[text] = emb
+        return emb
+
+    def lexical_overlap(self, text: str) -> float:
+        return fuzzy_fuzz.partial_ratio(text.lower(), self.query_text.lower()) / 100.0
+
+    def slot_overlap(self, text: str) -> float:
+        if not self.query_slots:
+            return 0.0
+        text_lower = text.lower()
+        hits = sum(1 for slot in self.query_slots if slot and slot in text_lower)
+        return hits / len(self.query_slots)
+
+    def compute_item_relevance(self, text: str) -> float:
+        emb = self.encode_text(text)
+        sim = float(st_util.cos_sim(
+            torch.from_numpy(np.array([emb])),
+            torch.from_numpy(np.array([self.query_embedding]))
+        )[0][0])
+        lex = self.lexical_overlap(text)
+        slot = self.slot_overlap(text)
+        return max(
+            0.0,
+            min(1.0, self.ALPHA * sim + self.BETA * lex + self.GAMMA * slot),
+        )
+
+    def _canonicalize_name(self, name: str) -> str:
+        if name in self.nodes:
+            return name
+        candidates = list(self.nodes.keys())
+        if not candidates:
+            return name
+        best_match, score, _ = fuzzy_process.extractOne(
+            name, candidates, scorer=fuzzy_fuzz.WRatio
+        )
+        if score >= 92:
+            return best_match
+        # Fallback to embedding sim
+        name_emb = self.encode_text(name)
+        cand_embs = [self.encode_text(c) for c in candidates]
+        sims = st_util.cos_sim(
+            torch.from_numpy(np.array([name_emb])),
+            torch.from_numpy(np.array(cand_embs)),
+        ).cpu().numpy()[0]
+        idx = int(np.argmax(sims))
+        if sims[idx] >= 0.78:
+            return candidates[idx]
+        return name
+
+    def _node_struct(self, canonical: str) -> Dict[str, Any]:
+        return self.nodes.setdefault(
+            canonical,
+            {
+                "id": canonical,
+                "attrs": defaultdict(dict),
+                "aliases": set([canonical]),
+                "relevance": 0.0,
+                "support": 0,
+                "timestamps": [],
+                "sources": [],
+            },
+        )
+
+    def update_node(
+        self,
+        original_name: str,
+        attrs: Dict[str, Any],
+        relevance: float,
+        timestamp: int,
+        frame_id: int,
+        confidence: float,
+    ) -> str:
+        canonical = self._canonicalize_name(original_name)
+        node = self._node_struct(canonical)
+        node["aliases"].add(original_name)
+        node["support"] += 1
+        node["relevance"] = max(node["relevance"], relevance)
+        node["timestamps"].append(timestamp)
+        node["sources"].append(frame_id)
+        weight = relevance * confidence
+        for attr, value in (attrs or {}).items():
+            if value in (None, "", []):
+                continue
+            value_str = str(value)
+            attr_bucket = node["attrs"].setdefault(attr, {})
+            attr_bucket[value_str] = attr_bucket.get(value_str, 0.0) + weight
+        return canonical
+
+    def update_edge(
+        self,
+        source: str,
+        relation: str,
+        target: str,
+        relevance: float,
+        timestamp: int,
+        frame_id: int,
+        confidence: float,
+    ) -> Dict[str, Any]:
+        key = (source, relation, target)
+        weight = relevance * confidence
+        if key in self.edge_lookup:
+            edge = self.edges[self.edge_lookup[key]]
+            edge["support"] += 1
+            edge["relevance"] = max(edge["relevance"], relevance)
+            edge["timestamps"].append(timestamp)
+            edge["sources"].append(frame_id)
+            edge["weight"] += weight
+            edge["versions"].append(
+                {"value": relation, "conf": confidence, "at": timestamp}
+            )
+            return edge
+        # Check conflicting relations between same nodes
+        alt_keys = [
+            (source, e["rel"], target) for e in self.edges
+            if e["source"] == source and e["target"] == target and e["rel"] != relation
+        ]
+        for alt_key in alt_keys:
+            alt_idx = self.edge_lookup.get(alt_key)
+            if alt_idx is not None:
+                self.edges[alt_idx]["versions"].append(
+                    {"value": relation, "conf": confidence, "at": timestamp}
+                )
+        edge = {
+            "source": source,
+            "rel": relation,
+            "target": target,
+            "relevance": relevance,
+            "support": 1,
+            "timestamps": [timestamp],
+            "sources": [frame_id],
+            "weight": weight,
+            "versions": [{"value": relation, "conf": confidence, "at": timestamp}],
+        }
+        self.edge_lookup[key] = len(self.edges)
+        self.edges.append(edge)
+        return edge
+
+    def update_choices(
+        self,
+        items: List[Dict[str, Any]],
+        timestamp: int,
+    ):
+        if not self.choices:
+            return
+        for choice_text, choice_data in self.choices.items():
+            emb = self.choice_embeddings[choice_text]
+            score_gain = 0.0
+            frame_evidence = []
+            for item in items:
+                item_emb = self.encode_text(item["text"])
+                sim = float(st_util.cos_sim(
+                    torch.from_numpy(np.array([item_emb])),
+                    torch.from_numpy(np.array([emb])),
+                )[0][0])
+                weight = item["weight"]
+                contribution = sim * weight
+                if contribution > 0:
+                    score_gain += contribution
+                    frame_evidence.append({
+                        "type": item["type"],
+                        "id": item["id"],
+                        "at": timestamp,
+                        "contribution": contribution,
+                    })
+            choice_data["score"] += score_gain
+            if frame_evidence:
+                choice_data["evidence"].append({
+                    "timestamp": timestamp,
+                    "items": frame_evidence,
+                })
+
+    def finalize(self) -> Dict[str, Any]:
+        finalized_nodes = []
+        for name, node in self.nodes.items():
+            attrs = {}
+            for attr_name, values in node["attrs"].items():
+                sorted_values = sorted(
+                    values.items(), key=lambda kv: kv[1], reverse=True
+                )
+                attrs[attr_name] = [
+                    {"value": val, "score": score} for val, score in sorted_values
+                ]
+            finalized_nodes.append(
+                {
+                    "id": name,
+                    "attrs": attrs,
+                    "aliases": sorted(node["aliases"]),
+                    "relevance": node["relevance"],
+                    "support": node["support"],
+                    "timestamps": node["timestamps"],
+                    "sources": node["sources"],
+                }
+            )
+
+        finalized_edges = []
+        for edge in self.edges:
+            finalized_edges.append(
+                {
+                    "source": edge["source"],
+                    "target": edge["target"],
+                    "rel": edge["rel"],
+                    "relevance": edge["relevance"],
+                    "support": edge["support"],
+                    "timestamps": edge["timestamps"],
+                    "sources": edge["sources"],
+                    "versions": edge["versions"],
+                    "weight": edge["weight"],
+                }
+            )
+
+        choices = {
+            choice: {
+                "score": data["score"],
+                "evidence": data["evidence"],
+            }
+            for choice, data in self.choices.items()
+        }
+
+        return {
+            "nodes": finalized_nodes,
+            "edges": finalized_edges,
+            "choices": choices,
+        }
+
+    def best_choice(self) -> Optional[str]:
+        if not self.choices:
+            return None
+        ranked = sorted(
+            self.choices.items(), key=lambda kv: kv[1]["score"], reverse=True
+        )
+        if not ranked:
+            return None
+        top_choice, top_data = ranked[0]
+        if len(ranked) == 1:
+            return top_choice
+        second_score = ranked[1][1]["score"]
+        if (top_data["score"] - second_score) < 0.05:
+            return None
+        return top_choice
+
+
+def node_text_repr(node: Dict[str, Any]) -> str:
+    name = node.get("name") or ""
+    attrs = node.get("attrs") or {}
+    attr_parts = []
+    if isinstance(attrs, dict):
+        for key, value in attrs.items():
+            if value in (None, "", []):
+                continue
+            attr_parts.append(f"{key}:{value}")
+    return (name + " " + " ".join(attr_parts)).strip()
+
+
+def edge_text_repr(edge: Dict[str, Any]) -> str:
+    src = edge.get("source") or edge.get("subject") or ""
+    rel = edge.get("rel") or edge.get("relation") or ""
+    tgt = edge.get("target") or edge.get("object") or ""
+    return f"{src} {rel} {tgt}".strip()
+
+
+def prepare_structured_prompt(query_text: str) -> str:
+    instruction = (
+        "You will see ONE image frame.\n"
+        "Focus ONLY on facts relevant to the query; ignore unrelated details.\n"
+        f"Query: \"{query_text}\"\n\n"
+        "Return a JSON with this exact schema:\n"
+        "{\n"
+        '  "nodes": [{"name": str, "attrs": {"color": str?, "count": int?}}],\n'
+        '  "edges": [{"source": str, "rel": str, "target": str}],\n'
+        '  "confidence": float,\n'
+        '  "note": str\n'
+        "}\n"
+        'If no relevant info, return {"nodes": [], "edges": [], "confidence": 0.0, "note": "no relevant info"}.\n'
+        "Do not add any extra fields or text."
+    )
+    return instruction
+
+
+def run_qaig_on_sample(
+    sample: Dict[str, Any],
+    args,
+    tokenizer,
+    model,
+    image_processor,
+    model_device,
+    model_dtype,
+) -> Dict[str, Any]:
+    qaig_result = copy.deepcopy(sample)
+    video_path = os.path.join(args.video_root, sample["video"])
+    shots = detect_shots(
+        video_path,
+        threshold=args.shot_threshold,
+        min_scene_len=args.shot_min_len,
+    )
+    if not shots:
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frames = len(vr)
+        del vr
+        shots = [(0, total_frames)]
+
+    qaig_threshold = getattr(args, "qaig_frame_threshold", 0.25)
+    qaig_conf_threshold = getattr(args, "qaig_conf_threshold", 0.5)
+    decay_tau = getattr(args, "qaig_decay_tau", 45.0)
+
+    query_text, choices = build_query_text(sample)
+    text_encoder = get_text_encoder()
+    query_embedding = text_encoder.encode(query_text, normalize_embeddings=True)
+    query_slots = extract_query_slots(query_text)
+    choice_entries = []
+    for ch in choices:
+        label, plain = normalize_choice_label(ch)
+        choice_entries.append(
+            {
+                "label": label,
+                "text": plain,
+                "raw": ch,
+            }
+        )
+    choice_texts = [c["text"] for c in choice_entries]
+
+    graph_state = QAIGraphState(
+        text_encoder=text_encoder,
+        query_text=query_text,
+        query_embedding=query_embedding,
+        query_slots=query_slots,
+        choices=choice_texts,
+        decay_tau=decay_tau,
+    )
+
+    clip_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    clip_bundle = get_clip_bundle(clip_device)
+    shot_outputs: List[Dict[str, Any]] = []
+    logs: List[Dict[str, Any]] = []
+
+    structured_prompt = prepare_structured_prompt(query_text)
+
+    for shot_idx, (fs, fe) in enumerate(shots):
+        rep = (fs + fe) // 2
+        img_rgb = read_frame(video_path, rep)
+        frame_relevance = compute_frame_relevance(
+            img_rgb, query_text, clip_bundle, clip_device
+        )
+        if frame_relevance < qaig_threshold:
+            logs.append(
+                {
+                    "shot_id": shot_idx,
+                    "frame": rep,
+                    "range_frames": [fs, fe],
+                    "frame_relevance": frame_relevance,
+                    "status": "skipped",
+                    "reason": "low relevance",
+                }
+            )
+            shot_outputs.append(
+                {
+                    "shot_id": shot_idx,
+                    "frame": rep,
+                    "range_frames": [fs, fe],
+                    "frame_relevance": frame_relevance,
+                    "note": "no relevant info",
+                    "nodes": [],
+                    "edges": [],
+                    "confidence": 0.0,
+                }
+            )
+            continue
+
+        one = np.expand_dims(img_rgb, axis=0)
+        video_tensor = image_processor.preprocess(one, return_tensors="pt")["pixel_values"]
+        video_tensor = video_tensor.to(device=model_device, dtype=model_dtype)
+
+        prompt_question = DEFAULT_IMAGE_TOKEN + structured_prompt
+        conv = copy.deepcopy(conv_templates["qwen_1_5"])
+        conv.append_message(conv.roles[0], prompt_question)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        input_ids = tokenizer_image_token(
+            prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+        ).unsqueeze(0).to(model_device)
+
+        with torch.inference_mode():
+            cont = model.generate(
+                input_ids,
+                images=[video_tensor],
+                modalities=["video"],
+                do_sample=False,
+                temperature=0,
+                max_new_tokens=min(args.max_new_tokens, 256),
+                use_cache=False,
+            )
+        text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
+
+        del input_ids, cont, video_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        parsed = safe_json_parse(text_outputs)
+        if not parsed:
+            logs.append(
+                {
+                    "shot_id": shot_idx,
+                    "frame": rep,
+                    "range_frames": [fs, fe],
+                    "frame_relevance": frame_relevance,
+                    "status": "skipped",
+                    "reason": "json_parse_failed",
+                    "raw_output": text_outputs,
+                }
+            )
+            shot_outputs.append(
+                {
+                    "shot_id": shot_idx,
+                    "frame": rep,
+                    "range_frames": [fs, fe],
+                    "frame_relevance": frame_relevance,
+                    "note": "parse error",
+                    "nodes": [],
+                    "edges": [],
+                    "confidence": 0.0,
+                }
+            )
+            continue
+
+        nodes = parsed.get("nodes") or []
+        edges = parsed.get("edges") or []
+        confidence = float(parsed.get("confidence", 0.0) or 0.0)
+        note = parsed.get("note") or ""
+
+        if confidence < qaig_conf_threshold or (
+            not nodes and not edges
+        ) or note.lower().strip() == "no relevant info":
+            logs.append(
+                {
+                    "shot_id": shot_idx,
+                    "frame": rep,
+                    "range_frames": [fs, fe],
+                    "frame_relevance": frame_relevance,
+                    "status": "skipped",
+                    "reason": "low confidence" if confidence < qaig_conf_threshold else "no relevant info",
+                    "confidence": confidence,
+                    "raw_output": parsed,
+                }
+            )
+            shot_outputs.append(
+                {
+                    "shot_id": shot_idx,
+                    "frame": rep,
+                    "range_frames": [fs, fe],
+                    "frame_relevance": frame_relevance,
+                    "note": "no relevant info",
+                    "nodes": [],
+                    "edges": [],
+                    "confidence": confidence,
+                }
+            )
+            continue
+
+        node_map: Dict[str, str] = {}
+        frame_items: List[Dict[str, Any]] = []
+
+        for node in nodes:
+            name = (node.get("name") or "").strip()
+            if not name:
+                continue
+            attrs = node.get("attrs") or {}
+            node_text = node_text_repr(node)
+            relevance = graph_state.compute_item_relevance(node_text)
+            node["relevance"] = relevance
+            canonical = graph_state.update_node(
+                original_name=name,
+                attrs=attrs,
+                relevance=relevance,
+                timestamp=shot_idx,
+                frame_id=rep,
+                confidence=confidence,
+            )
+            node_map[name] = canonical
+            frame_items.append(
+                {
+                    "type": "node",
+                    "id": canonical,
+                    "text": node_text,
+                    "weight": relevance * confidence,
+                }
+            )
+
+        for edge in edges:
+            src = edge.get("source") or edge.get("subject") or ""
+            tgt = edge.get("target") or edge.get("object") or ""
+            rel = edge.get("rel") or edge.get("relation") or ""
+            if not (src and tgt and rel):
+                continue
+            if src not in node_map:
+                node_map[src] = graph_state.update_node(
+                    original_name=src,
+                    attrs={},
+                    relevance=0.2,
+                    timestamp=shot_idx,
+                    frame_id=rep,
+                    confidence=confidence,
+                )
+            if tgt not in node_map:
+                node_map[tgt] = graph_state.update_node(
+                    original_name=tgt,
+                    attrs={},
+                    relevance=0.2,
+                    timestamp=shot_idx,
+                    frame_id=rep,
+                    confidence=confidence,
+                )
+            canonical_src = node_map[src]
+            canonical_tgt = node_map[tgt]
+            edge_text = edge_text_repr(edge)
+            relevance = graph_state.compute_item_relevance(edge_text)
+            edge["relevance"] = relevance
+            updated_edge = graph_state.update_edge(
+                source=canonical_src,
+                relation=rel,
+                target=canonical_tgt,
+                relevance=relevance,
+                timestamp=shot_idx,
+                frame_id=rep,
+                confidence=confidence,
+            )
+            frame_items.append(
+                {
+                    "type": "edge",
+                    "id": f"{canonical_src}->{rel}->{canonical_tgt}",
+                    "text": edge_text,
+                    "weight": relevance * confidence,
+                }
+            )
+
+        graph_state.update_choices(frame_items, timestamp=shot_idx)
+
+        shot_outputs.append(
+            {
+                "shot_id": shot_idx,
+                "frame": rep,
+                "range_frames": [fs, fe],
+                "frame_relevance": frame_relevance,
+                "note": note,
+                "nodes": nodes,
+                "edges": edges,
+                "confidence": confidence,
+            }
+        )
+        logs.append(
+            {
+                "shot_id": shot_idx,
+                "frame": rep,
+                "range_frames": [fs, fe],
+                "frame_relevance": frame_relevance,
+                "status": "updated",
+                "confidence": confidence,
+                "num_nodes": len(nodes),
+                "num_edges": len(edges),
+            }
+        )
+
+    final_graph = graph_state.finalize()
+    best_choice_text = graph_state.best_choice()
+
+    choice_outputs = []
+    for c in choice_entries:
+        data = final_graph["choices"].get(c["text"], {"score": 0.0, "evidence": []})
+        choice_outputs.append(
+            {
+                "label": c["label"],
+                "text": c["text"],
+                "raw": c["raw"],
+                "score": data.get("score", 0.0),
+                "evidence": data.get("evidence", []),
+            }
+        )
+
+    qaig_result.update(
+        {
+            "query": query_text,
+            "graph": final_graph,
+            "choices": choice_outputs,
+            "logs": logs,
+            "shot_outputs": shot_outputs,
+            "qaig_config": {
+                "frame_threshold": qaig_threshold,
+                "confidence_threshold": qaig_conf_threshold,
+                "decay_tau": decay_tau,
+            },
+        }
+    )
+    if best_choice_text:
+        match_entry = next((c for c in choice_outputs if c["text"] == best_choice_text), None)
+        if match_entry:
+            qaig_result["prediction"] = match_entry["label"]
+            qaig_result["prediction_text"] = match_entry["text"]
+        else:
+            qaig_result["prediction"] = best_choice_text
+    return qaig_result
 
 
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
@@ -168,13 +982,136 @@ def run(rank, world_size, args):
     model_device = first_param.device
     model_dtype = first_param.dtype
 
-    erf_engine = maybe_build_engine(args, tokenizer, model, image_processor)
+    if maybe_build_engine is None:
+        if args.erf_enable:
+            raise ImportError("ERF module not available but --erf_enable is set")
+        erf_engine = None
+    else:
+        erf_engine = maybe_build_engine(args, tokenizer, model, image_processor)
 
 
     result_list = []
     for cnt, sample in enumerate(tqdm(dataset)):
+        if args.shot_based:
+            outputs_dir = os.path.join(args.results_dir, "outputs")
+            os.makedirs(outputs_dir, exist_ok=True)
+            if getattr(args, "qaig", False):
+                qaig_path = os.path.join(outputs_dir, f"{sample['id']}_qaig.json")
+                if os.path.exists(qaig_path) and not args.no_cache:
+                    with open(qaig_path, "r") as f:
+                        cached_sample = json.load(f)
+                    result_list.append(cached_sample)
+                    continue
+
+                qaig_result = run_qaig_on_sample(
+                    sample=sample,
+                    args=args,
+                    tokenizer=tokenizer,
+                    model=model,
+                    image_processor=image_processor,
+                    model_device=model_device,
+                    model_dtype=model_dtype,
+                )
+
+                qaig_result["shot_outputs_path"] = []
+                for shot in qaig_result.get("shot_outputs", []):
+                    shot_path = os.path.join(
+                        outputs_dir, f"{sample['id']}_shot{shot['shot_id']}.json"
+                    )
+                    with open(shot_path, "w") as sf:
+                        json.dump(shot, sf, indent=2)
+                    qaig_result["shot_outputs_path"].append(os.path.relpath(shot_path, args.results_dir))
+
+                with open(qaig_path, "w") as f:
+                    json.dump(qaig_result, f, indent=2)
+
+                result_list.append(qaig_result)
+                continue
+            else:
+                video_path = os.path.join(args.video_root, sample["video"])
+                shot_files = []
+                if not args.no_cache:
+                    if os.path.isdir(outputs_dir):
+                        shot_files = sorted(
+                            [
+                                fp for fp in os.listdir(outputs_dir)
+                                if fp.startswith(f"{sample['id']}_shot") and fp.endswith(".json")
+                            ]
+                        )
+                if shot_files and not args.no_cache:
+                    cached = []
+                    for fname in shot_files:
+                        path = os.path.join(outputs_dir, fname)
+                        with open(path, "r") as f:
+                            cached.append(json.load(f))
+                    result_list.extend(cached)
+                    continue
+
+                shots = detect_shots(
+                    video_path,
+                    threshold=args.shot_threshold,
+                    min_scene_len=args.shot_min_len,
+                )
+                if not shots:
+                    vr = VideoReader(video_path, ctx=cpu(0))
+                    total_frames = len(vr)
+                    del vr
+                    shots = [(0, total_frames)]
+
+                shot_outputs = []
+                for sid, (fs, fe) in enumerate(shots):
+                    rep = (fs + fe) // 2
+                    img_rgb = read_frame(video_path, rep)
+                    one = np.expand_dims(img_rgb, axis=0)
+                    video_tensor = image_processor.preprocess(one, return_tensors="pt")["pixel_values"]
+                    video_tensor = video_tensor.to(device=model_device, dtype=model_dtype)
+
+                    prompt_question = DEFAULT_IMAGE_TOKEN + args.caption_prompt
+                    conv = copy.deepcopy(conv_templates["qwen_1_5"])
+                    conv.append_message(conv.roles[0], prompt_question)
+                    conv.append_message(conv.roles[1], None)
+                    prompt = conv.get_prompt()
+
+                    input_ids = tokenizer_image_token(
+                        prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+                    ).unsqueeze(0).to(model_device)
+
+                    with torch.inference_mode():
+                        cont = model.generate(
+                            input_ids,
+                            images=[video_tensor],
+                            modalities=["video"],
+                            do_sample=False,
+                            temperature=0,
+                            max_new_tokens=min(args.max_new_tokens, 128),
+                            use_cache=False,
+                        )
+                    text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
+
+                    shot_json = {
+                        "id": f"{sample.get('id')}_shot{sid}",
+                        "video": sample["video"],
+                        "shot_id": sid,
+                        "frame": rep,
+                        "range_frames": [fs, fe],
+                        "prediction": text_outputs,
+                        "question": "CAPTION",
+                    }
+                    shot_outputs.append(shot_json)
+
+                    per_shot_save = os.path.join(outputs_dir, f"{shot_json['id']}.json")
+                    with open(per_shot_save, "w") as f:
+                        json.dump(shot_json, f, indent=4)
+
+                    del input_ids, cont, video_tensor
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                result_list.extend(shot_outputs)
+                continue
+
         sample_save_path = f"{args.results_dir}/outputs/{sample['id']}.json"
-        load_cached = os.path.exists(sample_save_path) and not args.erf_enable
+        load_cached = os.path.exists(sample_save_path) and not args.erf_enable and not args.no_cache
         if load_cached:
             with open(sample_save_path, "r") as f:
                 sample = json.load(f)
@@ -319,6 +1256,27 @@ def main():
     parser.add_argument("--erf_tau", type=float, default=0.8)
     parser.add_argument("--erf_weights", type=str, default="0.4,0.4,0.2,0.0")
     parser.add_argument("--erf_debug", action="store_true")
+    parser.add_argument("--no_cache", action="store_true", help="Ignore existing cached outputs")
+    parser.add_argument("--shot_based", action="store_true",
+                        help="Use PySceneDetect to split shots and caption exactly 1 frame per shot.")
+    parser.add_argument("--shot_threshold", type=float, default=27.0,
+                        help="PySceneDetect ContentDetector threshold (higher = fewer shots).")
+    parser.add_argument("--shot_min_len", type=int, default=15,
+                        help="Minimum scene length in frames for PySceneDetect.")
+    parser.add_argument(
+        "--caption_prompt",
+        type=str,
+        default="Describe this image in one concise sentence.",
+        help="Prompt for captioning a single representative frame.",
+    )
+    parser.add_argument("--qaig", action="store_true",
+                        help="Enable Query-Adaptive Incremental Graphing pipeline for shot-based runs.")
+    parser.add_argument("--qaig_frame_threshold", type=float, default=0.25,
+                        help="Frame-level relevance threshold (CLIP cosine).")
+    parser.add_argument("--qaig_conf_threshold", type=float, default=0.5,
+                        help="Minimum confidence from structured extractor to accept updates.")
+    parser.add_argument("--qaig_decay_tau", type=float, default=45.0,
+                        help="Temporal decay tau used when updating graph statistics.")
 
     args = parser.parse_args()
     if args.model_base == "None":

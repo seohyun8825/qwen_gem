@@ -1,0 +1,142 @@
+[
+  {
+    "id": 0,
+    "video_id": "001",
+    "video": "fFjv93ACGo8.mp4",
+    "question_type": "short",
+    "question": "When demonstrating the Germany modern Christmas tree initially decorated with apples, candles and berries, which kind of decoration is seen in the largest number on the tree?",
+    "candidates": [
+      "A. Red apples hanging from the green branches of the Christmas tree.",
+      "B. White candles standing upright among the tree branches.",
+      "C. Small red berries clustered densely around the ornaments and leaves.",
+      "D. The three kinds appearing in the same number on the tree."
+    ],
+    "answer": "C"
+  },
+  {
+    "id": 1,
+    "video_id": "001",
+    "video": "fFjv93ACGo8.mp4",
+    "question_type": "short",
+    "question": "What is the genre of this video as shown through the scenes and narration?",
+    "candidates": [
+      "A. A news report with narration explaining the history of Christmas decorations.",
+      "B. A documentary showing step-by-step footage of traditional holiday recipes.",
+      "C. A travel vlog showing people walking through Christmas markets in different countries.",
+      "D. A tutorial video where hands are crafting ornaments on a worktable."
+    ],
+    "answer": "A"
+  },
+  {
+    "id": 2,
+    "video_id": "001",
+    "video": "fFjv93ACGo8.mp4",
+    "question_type": "short",
+    "question": "At the end of the video, how many red socks can be seen hanging above the fireplace?",
+    "candidates": [
+      "A. One red sock hanging at the center of the mantel.",
+      "B. Four red socks lined evenly above the fireplace.",
+      "C. Two red socks hanging side by side on the mantel edge.",
+      "D. Three red socks hanging in a row over the fireplace."
+    ],
+    "answer": "D"
+  },
+  {
+    "id": 3,
+    "video_id": "002",
+    "video": "N1cdUjctpG8.mp4",
+    "question_type": "short",
+    "question": "Which of the following features or items is not shown or mentioned in the frames about the tomb?",
+    "candidates": [
+      "A. A dark rectangular inkstone resting beside the inner brick wall.",
+      "B. A niche carved into the stone wall with an arched opening.",
+      "C. A piece of polished green jade displayed under the light.",
+      "D. A flat sacrificial stone table placed near the tomb entrance."
+    ],
+    "answer": "C"
+  },
+  {
+    "id": 4,
+    "video_id": "002",
+    "video": "N1cdUjctpG8.mp4",
+    "question_type": "short",
+    "question": "Which of the following reasons is shown on screen as motivating the archaeologists to excavate the tomb?",
+    "candidates": [
+      "A. A caption mentioning the Ming Dynasty and its archaeological value.",
+      "B. A map displaying a railway line running close to the site.",
+      "C. A note describing treasures believed to be inside the tomb.",
+      "D. A highway diagram appearing beside the tomb area showing a route realignment."
+    ],
+    "answer": "D"
+  },
+  {
+    "id": 5,
+    "video_id": "002",
+    "video": "N1cdUjctpG8.mp4",
+    "question_type": "short",
+    "question": "How many porcelain jars are visible in the niches located in the primary chamber of the tomb?",
+    "candidates": [
+      "A. Four porcelain jars lined up in the stone recesses.",
+      "B. Nine white porcelain jars arranged neatly along the wall niches.",
+      "C. Five blue-and-white porcelain jars placed near the entrance.",
+      "D. Thirteen porcelain jars stacked together inside the chamber."
+    ],
+    "answer": "B"
+  },
+  {
+    "id": 6,
+    "video_id": "003",
+    "video": "HIjX8OPuf-w.mp4",
+    "question_type": "short",
+    "question": "How many national flags appear visibly in the frames throughout the video?",
+    "candidates": [
+      "A. Three national flags waving side by side.",
+      "B. Four national flags shown one after another across scenes.",
+      "C. Two national flags appearing on the same screen.",
+      "D. Five national flags shown during the montage sequence."
+    ],
+    "answer": "B"
+  },
+  {
+    "id": 7,
+    "video_id": "003",
+    "video": "HIjX8OPuf-w.mp4",
+    "question_type": "short",
+    "question": "What is being described on screen when the burger appears in the upper right corner at the end of the video?",
+    "candidates": [
+      "A. A plate of beef with spices labeled as coming from Russia to Germany.",
+      "B. A steak being placed between two slices of bread on screen.",
+      "C. A map of the United States with animated lines showing burger spread nationwide.",
+      "D. An image of identical hamburgers arranged to indicate standardization."
+    ],
+    "answer": "C"
+  },
+  {
+    "id": 8,
+    "video_id": "003",
+    "video": "HIjX8OPuf-w.mp4",
+    "question_type": "short",
+    "question": "In which country is the food featured in the video shown as being recognized worldwide?",
+    "candidates": [
+      "A. The map highlights Mongolia with its flag on screen.",
+      "B. Russia’s flag appears over the country’s map area.",
+      "C. Germany is shown with its national flag overlay.",
+      "D. The United States map appears with the burger icon and waving flag."
+    ],
+    "answer": "D"
+  },
+  {
+    "id": 9,
+    "video_id": "004",
+    "video": "HwnB8aCn8yE.mp4",
+    "question_type": "short",
+    "question": "According to the video, which of the following is considered the earliest stage of human evolution as shown on screen?",
+    "candidates": [
+      "A. The word ‘Ramapithecus’ appearing below an ape-like figure in the chart.",
+      "B. The label ‘Dryopithecus’ shown under the first primate silhouette.",
+      "C. The title ‘Ardipithecus Ramidus’ written under a later-stage figure.",
+      "D. The term ‘Homo Sapiens’ displayed under the modern human image."
+    ],
+    "answer": "B"
+  }
+]
