@@ -2,12 +2,12 @@ import argparse
 import json
 import os
 
-
 import numpy as np
 import torch
 from PIL import Image
 
 from llava.model.builder import load_pretrained_model
+from gem.clip_scorer import get_clip_scorer
 from gem.config import DEFAULT_MAX_FRAMES, DEVICE
 from gem.gem_core import gem_whitebox
 from gem.heatmap import token_sim_heatmap
@@ -15,7 +15,7 @@ from gem.io_utils import bgr, load_dataset_json, read_video_frames
 from gem.prompt import split_action_prompt
 from gem.text_encoder import TextEncoder
 from gem.vision_introspect import ViTWhitebox
-from gem.vis import save_heatmaps_and_peaks, save_meta
+from gem.vis import save_heatmaps_and_peaks, save_meta, save_relevance_strip
 
 
 def _locate_mm_projector(model) -> torch.nn.Module | None:
@@ -146,6 +146,30 @@ def run_one_video(
         labels = {"verb": prompt_verb, "object": prompt_object, "action": prompt_action}
         weights = None
     save_heatmaps_and_peaks(out_dir, frames_bgr, heatmaps, weights=weights, labels=labels)
+
+    clip_prompts = labels if labels else {key: str(key) for key in heatmaps.keys()}
+    clip_score_log = {}
+    if clip_prompts:
+        try:
+            clip_scorer = get_clip_scorer()
+            clip_scores = clip_scorer.score_frames(frames_rgb, clip_prompts)
+        except Exception as exc:
+            clip_scores = None
+            print("[GEM][clip][ERR] scoring failed:", exc)
+        if clip_scores:
+            for key, scores_array in clip_scores.items():
+                safe_key = str(key).replace(" ", "_")
+                prompt_text = clip_prompts.get(key, str(key))
+                scores_list = [float(val) for val in scores_array.tolist()]
+                clip_score_log[key] = [{"frame": idx, "score": score} for idx, score in enumerate(scores_list)]
+                save_relevance_strip(
+                    out_path=os.path.join(out_dir, f"{safe_key}_relevance_clip.png"),
+                    frames_bgr=frames_bgr,
+                    scores=scores_list,
+                    prompt=prompt_text,
+                )
+            with open(os.path.join(out_dir, "frame_scores_clip.json"), "w") as fp:
+                json.dump(clip_score_log, fp, indent=2)
     save_meta(
         out_dir,
         {

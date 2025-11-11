@@ -25,5 +25,5 @@ def split_action_prompt(text: str):
 
     verb_prompt = f"A photo of a person {verb} something."
     object_prompt = f"A photo of a person using {obj}."
-    action_prompt = f"A photo of a person {text.strip().rstrip('.')}"
+    action_prompt = f"{text.strip().rstrip('.')}"
     return verb_prompt, object_prompt, action_prompt

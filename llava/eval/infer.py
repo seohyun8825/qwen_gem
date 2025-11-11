@@ -874,6 +874,22 @@ def run_qaig_on_sample(
     return qaig_result
 
 
+def load_frames_by_indices(video_path, indices):
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+    total_frame_num = len(vr)
+    avg_fps = float(vr.get_avg_fps()) if vr.get_avg_fps() > 0 else 30.0
+    if not indices:
+        midpoint = total_frame_num // 2 if total_frame_num else 0
+        indices = [midpoint]
+    max_idx = max(total_frame_num - 1, 0)
+    safe_indices = [min(max(0, int(idx)), max_idx) for idx in indices]
+    frames = vr.get_batch(safe_indices).asnumpy()
+    frame_times = [idx / max(1e-6, avg_fps) for idx in safe_indices]
+    frame_time = ",".join(f"{t:.2f}s" for t in frame_times)
+    video_time = total_frame_num / max(1e-6, avg_fps)
+    return frames, frame_time, video_time
+
+
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
     if max_frames_num == 0:
         return np.zeros((1, 336, 336, 3))
@@ -1117,9 +1133,32 @@ def run(rank, world_size, args):
                 sample = json.load(f)
         else:
             video_path = os.path.join(args.video_root, sample["video"])
-            video_np, frame_time, video_time = load_video(
-                video_path, args.max_frames_num, fps=1, force_sample=True
-            )
+            use_selected = False
+            selected_indices = []
+            if args.selected_frames_root:
+                sample_id = sample.get("id")
+                if sample_id is not None:
+                    selected_path = os.path.join(
+                        args.selected_frames_root, f"{sample_id}_selected.json"
+                    )
+                    if os.path.exists(selected_path):
+                        with open(selected_path, "r", encoding="utf-8") as sf:
+                            sel_payload = json.load(sf)
+                        selected_entries = sel_payload.get("selected") or []
+                        selected_indices = [
+                            int(entry.get("frame_index", 0)) for entry in selected_entries
+                        ]
+                        if args.selected_frames_topn and args.selected_frames_topn > 0:
+                            selected_indices = selected_indices[: args.selected_frames_topn]
+                        if selected_indices:
+                            use_selected = True
+
+            if use_selected:
+                video_np, frame_time, video_time = load_frames_by_indices(video_path, selected_indices)
+            else:
+                video_np, frame_time, video_time = load_video(
+                    video_path, args.max_frames_num, fps=1, force_sample=True
+                )
             video_tensor = image_processor.preprocess(video_np, return_tensors="pt")[
                 "pixel_values"
             ]
@@ -1247,6 +1286,10 @@ def main():
     parser.add_argument("--data_path", type=str, default="/mnt/bum/mmiemon/datasets/Video-MME/formatted_dataset.json")
     parser.add_argument("--video_root", type=str, default="/mnt/bum/mmiemon/datasets/Video-MME/videos/data")
     parser.add_argument("--results_dir", type=str, default="/mnt/bum/mmiemon/LLaVA-NeXT/results/llava_video/VideoMME")
+    parser.add_argument("--selected_frames_root", type=str, default=None,
+                        help="Optional directory containing <sample_id>_selected.json files to drive frame selection.")
+    parser.add_argument("--selected_frames_topn", type=int, default=0,
+                        help="If >0, limit number of selected frames loaded for inference (0 means all).")
     parser.add_argument("--test_ratio", type=float, default=1)
     parser.add_argument("--multiprocess", action="store_true")
     parser.add_argument("--cals_acc", action="store_true")
