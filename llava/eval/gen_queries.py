@@ -5,8 +5,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 from decord import VideoReader, cpu
 from tqdm import tqdm
 
@@ -124,7 +126,38 @@ INSTRUCTION_TMPL = (
     "No commentary, no extra keys, no trailing commas.\n"
 )
 
-def build_prompt(question: str, shot_infos: List[Dict[str, Any]]) -> str:
+def format_question_with_choices(sample: Dict[str, Any]) -> str:
+    question = (sample.get("question") or "").strip()
+    candidates = sample.get("candidates") or []
+    lines: List[str] = []
+    if isinstance(candidates, dict):
+        iterable = candidates.items()
+    else:
+        iterable = enumerate(candidates)
+    letter_ord = ord("A")
+    for key, value in iterable:
+        if isinstance(value, dict):
+            text = value.get("text") or value.get("answer") or ""
+            label = value.get("label")
+        else:
+            text = str(value)
+            label = None
+        text = text.strip()
+        if not text:
+            continue
+        if not label:
+            if isinstance(key, str):
+                label = key
+            else:
+                label = chr(letter_ord)
+                letter_ord += 1
+        lines.append(f"{label}. {text}")
+    if lines:
+        return question + "\nChoices:\n" + "\n".join(lines)
+    return question
+
+
+def build_prompt(sample: Dict[str, Any], shot_infos: List[Dict[str, Any]]) -> str:
     shot_text = ""
     if shot_infos:
         shot_lines = []
@@ -142,7 +175,8 @@ def build_prompt(question: str, shot_infos: List[Dict[str, Any]]) -> str:
             )
         shot_text = "Shots overview:\n" + "\n".join(shot_lines) + "\n"
 
-    return DEFAULT_IMAGE_TOKEN + f"{INSTRUCTION_TMPL}\n\n{shot_text}Question: {question}"
+    question_block = format_question_with_choices(sample)
+    return DEFAULT_IMAGE_TOKEN + f"{INSTRUCTION_TMPL}\n\n{shot_text}Question: {question_block}"
 
 
 def safe_json_parse(text: str) -> Dict[str, Any]:
@@ -213,7 +247,7 @@ def main():
         )
 
         conv = conv_templates["qwen_1_5"].copy()
-        conv.append_message(conv.roles[0], build_prompt(sample["question"], shot_infos))
+        conv.append_message(conv.roles[0], build_prompt(sample, shot_infos))
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
 
@@ -230,8 +264,37 @@ def main():
                 temperature=0.0,
                 max_new_tokens=512,
                 use_cache=False,
+                return_dict_in_generate=True,
+                output_scores=True,
             )
-        raw_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+        sequences = outputs.sequences
+        raw_text = tokenizer.batch_decode(sequences, skip_special_tokens=True)[0].strip()
+        token_stats: List[Dict[str, Any]] = []
+        avg_logprob = None
+
+        if outputs.scores:
+            gen_token_count = len(outputs.scores)
+            if gen_token_count > 0:
+                gen_token_ids = sequences[0, -gen_token_count:]
+            else:
+                gen_token_ids = sequences.new_empty((0,), dtype=torch.long)
+            logprob_sum = 0.0
+            for step, (logits, token_id) in enumerate(zip(outputs.scores, gen_token_ids)):
+                log_probs = F.log_softmax(logits[0], dim=-1)
+                logprob = float(log_probs[token_id].item())
+                logprob_sum += logprob
+                token_text = tokenizer.decode([int(token_id)], skip_special_tokens=True)
+                token_stats.append(
+                    {
+                        "step": step,
+                        "token_id": int(token_id),
+                        "token": token_text,
+                        "logprob": logprob,
+                        "prob": float(math.exp(logprob)),
+                    }
+                )
+            if token_stats:
+                avg_logprob = logprob_sum / len(token_stats)
         parsed = safe_json_parse(raw_text)
         queries = parsed.get("queries") or []
 
@@ -261,6 +324,11 @@ def main():
         }
         if shot_infos:
             result["shots"] = shot_infos
+        if token_stats:
+            result["token_stats"] = {
+                "avg_logprob": avg_logprob,
+                "tokens": token_stats,
+            }
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
